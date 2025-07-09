@@ -128,6 +128,12 @@ async def fetch_posts(client_wrapper, id):
             logger.warning(f"No valid sources found for TBs {tb_ids}")
             return [], unique_stop_words
 
+        
+        copied_messages = {}
+        message_save = await repo_art.select_all()
+        for mess in message_save:
+            copied_messages[mess.chat_id] = mess.message_id
+
         messages = []
         logger.info(f"Fetching posts from sources: {unique_sources} for TBs {tb_ids}")
         await account_manager.log_to_chat(f"🔍 Fetching from {len(unique_sources)} sources for TBs {tb_ids}", "INFO")
@@ -140,7 +146,7 @@ async def fetch_posts(client_wrapper, id):
                 logger.info(f"Channel details: {channel}")
                 
                 # Получаем time_back - используем максимальный из всех ТБ
-                max_time_back = 900  # по умолчанию 15 часов
+                max_time_back = 180  # по умолчанию 15 часов
                 for tb_id in tb_ids:
                     try:
                         tb = await repo.select_id(int(tb_id))
@@ -159,16 +165,21 @@ async def fetch_posts(client_wrapper, id):
                 logger.info(f"Fetching messages from {source} with offset_date: {offset_date} (time_back: {max_time_back}min)")
                 
                 try:
-                    # Используем безопасную итерацию сообщений
+                    # Используем безопасную итерацию сообщений БЕЗ offset_date в параметрах
                     async for message in client_wrapper.safe_iter_messages(
                         channel, 
-                        offset_date=offset_date, 
                         reverse=True,
                         limit=50  # Ограничиваем количество сообщений
                     ):
                         try:
                             if message.date < offset_date:
                                 logger.debug(f"Message {message.id} from {source} is older than offset_date.")
+                                continue
+
+                            # ПРОВЕРКА НА ДУБЛИКАТ
+                            channel_id = channel.id
+                            if channel_id in copied_messages and copied_messages[channel_id] == message.id:
+                                logger.debug(f"Message {message.id} from {source} already copied, skipping")
                                 continue
 
                             # Если сообщение не содержит ни текста, ни медиа, пропускаем
