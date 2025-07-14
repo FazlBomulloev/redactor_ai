@@ -128,12 +128,6 @@ async def fetch_posts(client_wrapper, id):
             logger.warning(f"No valid sources found for TBs {tb_ids}")
             return [], unique_stop_words
 
-        
-        copied_messages = {}
-        message_save = await repo_art.select_all()
-        for mess in message_save:
-            copied_messages[mess.chat_id] = mess.message_id
-
         messages = []
         logger.info(f"Fetching posts from sources: {unique_sources} for TBs {tb_ids}")
         await account_manager.log_to_chat(f"🔍 Fetching from {len(unique_sources)} sources for TBs {tb_ids}", "INFO")
@@ -146,7 +140,7 @@ async def fetch_posts(client_wrapper, id):
                 logger.info(f"Channel details: {channel}")
                 
                 # Получаем time_back - используем максимальный из всех ТБ
-                max_time_back = 180  # по умолчанию 15 часов
+                max_time_back = 900  # по умолчанию 15 часов
                 for tb_id in tb_ids:
                     try:
                         tb = await repo.select_id(int(tb_id))
@@ -165,21 +159,16 @@ async def fetch_posts(client_wrapper, id):
                 logger.info(f"Fetching messages from {source} with offset_date: {offset_date} (time_back: {max_time_back}min)")
                 
                 try:
-                    # Используем безопасную итерацию сообщений БЕЗ offset_date в параметрах
+                    # Используем безопасную итерацию сообщений
                     async for message in client_wrapper.safe_iter_messages(
                         channel, 
                         reverse=True,
+                        offset_date=offset_date,  
                         limit=50  # Ограничиваем количество сообщений
                     ):
                         try:
                             if message.date < offset_date:
                                 logger.debug(f"Message {message.id} from {source} is older than offset_date.")
-                                continue
-
-                            # ПРОВЕРКА НА ДУБЛИКАТ
-                            channel_id = channel.id
-                            if channel_id in copied_messages and copied_messages[channel_id] == message.id:
-                                logger.debug(f"Message {message.id} from {source} already copied, skipping")
                                 continue
 
                             # Если сообщение не содержит ни текста, ни медиа, пропускаем
@@ -318,13 +307,15 @@ def AI(mess, retries=3, delay=1):
 
 async def get_all_matches(desc, messages, ignore_duplicates=False):
     """Получает все подходящие сообщения, отсортированные по рейтингу"""
-    copied_messages = {}
+    
+    
+    copied_message_ids = set()
     if not ignore_duplicates:
-        message_save = await repo_art.select_all()
-        for mess in message_save:
-            copied_messages[mess.chat_id] = mess.message_id
+        copied_message_ids = await repo_art.get_all_copied_message_ids()
+        logger.info(f"Checking against {len(copied_message_ids)} previously copied messages")
     
     matches = []
+    duplicate_count = 0
     
     logger.info(f"Analyzing {len(messages)} messages for matches")
     await account_manager.log_to_chat(f"🤖 Analyzing {len(messages)} messages with AI", "INFO")
@@ -332,6 +323,12 @@ async def get_all_matches(desc, messages, ignore_duplicates=False):
     for message in messages:
         if not message.text or message.text == "":
             logger.debug(f"Message text is None or empty for message ID: {message.id}")
+            continue
+
+        
+        if not ignore_duplicates and message.id in copied_message_ids:
+            duplicate_count += 1
+            logger.debug(f"Message {message.id} skipped - already copied (duplicate #{duplicate_count})")
             continue
 
         try:
@@ -346,17 +343,7 @@ async def get_all_matches(desc, messages, ignore_duplicates=False):
 
         logger.info(f"Message {message.id} from chat {message.peer_id.channel_id} has ratio {ratio:.3f} ({ratio*100:.1f}%)")
         
-        # Проверяем, не было ли сообщение уже скопировано
-        already_copied = False
-        if not ignore_duplicates:
-            for key, value in copied_messages.items():
-                if key == message.peer_id.channel_id and value == message.id:
-                    logger.debug(f"Message {message.id} from chat {message.peer_id.channel_id} already copied.")
-                    already_copied = True
-                    break
-        
-        
-        if not already_copied and ratio >= 0.85:
+        if ratio >= 0.85:
             matches.append({
                 'message': message,
                 'ratio': ratio,
@@ -364,16 +351,16 @@ async def get_all_matches(desc, messages, ignore_duplicates=False):
             })
             logger.info(f"✅ Message {message.id} added to matches with {ratio:.3f} ({ratio*100:.1f}%)")
         else:
-            if already_copied:
-                logger.info(f"❌ Message {message.id} skipped - already copied")
-            else:
-                logger.info(f"❌ Message {message.id} skipped - rating {ratio:.3f} ({ratio*100:.1f}%) < 85%")
+            logger.info(f"❌ Message {message.id} skipped - rating {ratio:.3f} ({ratio*100:.1f}%) < 85%")
 
     # Сортируем по рейтингу (от большего к меньшему)
     matches.sort(key=lambda x: x['ratio'], reverse=True)
     
-    logger.info(f"Found {len(matches)} potential matches with rating >= 85%")
-    await account_manager.log_to_chat(f"🎯 Found {len(matches)} matches with rating >= 85%", "SUCCESS" if matches else "WARNING")
+    logger.info(f"Found {len(matches)} potential matches with rating >= 85%. Skipped {duplicate_count} duplicates.")
+    await account_manager.log_to_chat(
+        f"🎯 Found {len(matches)} matches (≥85%) | Skipped {duplicate_count} duplicates", 
+        "SUCCESS" if matches else "WARNING"
+    )
     return matches
 
 
