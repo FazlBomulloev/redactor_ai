@@ -139,8 +139,6 @@ class TextCorrector:
             # Ищем лучшее место для разрыва в порядке приоритета:
             # 1. Точка + пробел (конец предложения)
             # 2. Восклицательный/вопросительный знак + пробел  
-            # 3. Запятая + пробел
-            # 4. Обычный пробел
             
             # Ищем конец предложения (точка + пробел)
             for i in range(max_length - 1, max_length * 0.7, -1):
@@ -152,19 +150,6 @@ class TextCorrector:
                         split_pos = i + 1  # Включаем знак, исключаем пробел
                         break
             
-            # Если не нашли конец предложения, ищем запятую
-            if split_pos == max_length:
-                for i in range(max_length - 1, max_length * 0.8, -1):
-                    if i < len(remaining_text) - 1:
-                        if remaining_text[i] == ',' and remaining_text[i + 1] == ' ':
-                            split_pos = i + 1  # Включаем запятую, исключаем пробел
-                            break
-            
-            # Если не нашли запятую, ищем обычный пробел
-            if split_pos == max_length:
-                last_space = remaining_text.rfind(' ', int(max_length * 0.8), max_length)
-                if last_space > 0:
-                    split_pos = last_space
             
             part = remaining_text[:split_pos].rstrip()
             parts.append(part)
