@@ -152,3 +152,11 @@ class ArticleRepository(BaseRepository):
             }
         except Exception as e:
             raise RuntimeError(f"Failed to get statistics: {e}")
+
+    async def get_all_copied_message_ids(self):
+        async with self.db() as session:
+            try:
+                result = await session.execute(select(Article.message_id))
+                return {row[0] for row in result.all()}
+            except SQLAlchemyError as e:
+                raise RuntimeError(f"Failed to get all copied message IDs: {e}")

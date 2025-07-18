@@ -16,7 +16,7 @@ from telethon.tl.types import (
     MessageMediaWebPage,
 )
 from utils.telethon import TelegramClientWrapper
-
+import utils.text_corrector
 from core.repositories.stop_words import StopWordsRepository
 
 # Импортируем только медиа логгер
