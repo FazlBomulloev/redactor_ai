@@ -1,0 +1,326 @@
+import os
+import asyncio
+from telethon import TelegramClient
+from telethon.errors import PhoneNumberBannedError, FloodWaitError, AuthKeyUnregisteredError
+from telethon.tl.functions.messages import SendMediaRequest
+from telethon.tl.types import InputMediaPhoto, InputMediaDocument
+
+from aiogram import Bot
+
+from core.config import settings
+ACCOUNTS_DIR = os.path.join(os.getcwd(), "accounts")
+
+api_id = 26515046
+api_hash = "22b6dbdfce28e71ce66911f29ccc5bfe"
+
+super_adm = [6640814090, 817411344]
+ADMIN_BOT_TOKEN = "6830235739:AAG0Bo5lnabU4hDVWlhPQmLtiMVePI2xRGg"
+admin_bot = Bot(token=ADMIN_BOT_TOKEN)
+
+
+class TelegramClientWrapper:
+    def __init__(self):
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.ACCOUNTS_DIR = os.path.join(os.getcwd(), "accounts")
+        self._clients = {}
+        self.current_client_key = None
+        self.lock = asyncio.Lock()
+
+        if not os.path.exists(self.ACCOUNTS_DIR):
+            os.makedirs(self.ACCOUNTS_DIR)
+
+    async def load_accounts(self):
+        try:
+            loaded_any = False
+            for filename in os.listdir(self.ACCOUNTS_DIR):
+                if filename.endswith(".session"):
+                    try:
+                        await self._try_add_account(filename)
+                        loaded_any = True
+                    except Exception as e:
+                        print(f"[WARNING] Аккаунт {filename} не авторизован или ошибка: {e}")
+            if not loaded_any:
+                raise Exception("Нет доступных аккаунтов")
+            self.current_client_key = list(self._clients.keys())[0]
+            print(f"Loaded accounts: {len(self._clients)}")
+            print(f"Current account: {self.current_client_key}")
+        except Exception as e:
+            print(f"[WARNING] {e}")
+            await self.notify_admin_no_active_accounts()
+
+    async def _try_add_account(self, session_name):
+        session_path = os.path.join(self.ACCOUNTS_DIR, session_name)
+        client = TelegramClient(session_path, self.api_id, self.api_hash)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise Exception(f"Аккаунт {session_name} не авторизован")
+        self._clients[session_name] = client
+        print(f"[+] Аккаунт добавлен: {session_name}")
+
+    async def watch_for_new_accounts(self):
+        existing = set(os.listdir(self.ACCOUNTS_DIR))
+        while True:
+            await asyncio.sleep(15)
+            current = set(os.listdir(self.ACCOUNTS_DIR))
+            new_sessions = current - existing
+            for session in new_sessions:
+                if session.endswith(".session"):
+                    try:
+                        await self._try_add_account(session)
+                        if not self.current_client_key:
+                            self.current_client_key = session
+                    except Exception as e:
+                        print(f"[!] Ошибка добавления нового аккаунта: {e}")
+            existing = current
+
+    async def switch_to_next_account(self):
+        """Переключиться на следующий аккаунт с уведомлением в логи"""
+        from utils.account_manager import account_manager
+        
+        old_account = self.current_client_key
+        
+        if self.current_client_key:
+            # Закрываем и удаляем текущий клиент
+            client = self._clients.pop(self.current_client_key)
+            try:
+                await client.disconnect()
+            except:
+                pass  # Игнорируем ошибки при отключении
+            
+            # Удаляем файл сессии
+            session_file = os.path.join(self.ACCOUNTS_DIR, self.current_client_key)
+            if os.path.exists(session_file):
+                try:
+                    os.remove(session_file)
+                except:
+                    pass  # Игнорируем ошибки удаления файла
+            
+            print(f"[!] Удалён аккаунт: {old_account}")
+
+        if not self._clients:
+            self.current_client_key = None
+            await self.notify_admin_no_active_accounts()
+            raise Exception("Нет доступных аккаунтов")
+
+        self.current_client_key = list(self._clients.keys())[0]
+        
+        # Логируем переключение
+        remaining_count = len(self._clients)
+        await account_manager.log_to_chat(
+            f"🔄 Switched account | Old: {old_account} | New: {self.current_client_key} | Remaining: {remaining_count}",
+            "INFO"
+        )
+        
+        print(f"[+] Переключен на: {self.current_client_key}")
+
+    async def ensure_connected(self, client):
+        """Убеждаемся, что клиент подключен"""
+        try:
+            if not client.is_connected():
+                await client.connect()
+        
+            # Проверяем авторизацию
+            if not await client.is_user_authorized():
+                raise Exception("Client is not authorized")
+            
+            return True
+        except Exception as e:
+            print(f"[!] Connection check failed: {e}")
+            return False
+
+    async def get_current_client_safe(self):
+        """Получить текущий клиент с проверкой соединения"""
+        if not self.current_client_key:
+            raise Exception("Нет активного клиента")
+    
+        client = self._clients[self.current_client_key]
+    
+        if not await self.ensure_connected(client):
+            # Попытка переключиться на следующий аккаунт
+            await self.switch_to_next_account()
+            client = self._clients[self.current_client_key]
+            if not await self.ensure_connected(client):
+                raise Exception("Не удалось подключиться ни к одному клиенту")
+    
+        return client
+
+    async def reconnect_current_client(self):
+        """Переподключить текущий клиент"""
+        if not self.current_client_key:
+            return False
+    
+        try:
+            client = self._clients[self.current_client_key]
+            if client.is_connected():
+                await client.disconnect()
+        
+            await asyncio.sleep(2)
+            await client.connect()
+        
+            if await client.is_user_authorized():
+                print(f"[+] Успешно переподключен: {self.current_client_key}")
+                return True
+            else:
+                print(f"[!] Клиент не авторизован после переподключения: {self.current_client_key}")
+                return False
+            
+        except Exception as e:
+            print(f"[!] Ошибка переподключения: {e}")
+            return False
+
+    def get_current_client(self):
+        if self.current_client_key:
+            return self._clients[self.current_client_key]
+        raise Exception("Нет активного клиента")
+
+    async def send_message(self, chat_id, message, retry=True):
+        async with self.lock:
+            try:
+                client = self.get_current_client()
+                await client.send_message(chat_id, message)
+            except Exception as e:
+                print(f"[!] Ошибка отправки сообщения: {e}")
+                try:
+                    await self.switch_to_next_account()
+                except Exception:
+                    return  # Сообщение админу уже отправлено
+                if retry:
+                    await self.send_message(chat_id, message, retry=False)
+
+    async def send_photo(self, chat_id, file_id, caption, retry=True):
+        async with self.lock:
+            try:
+                client = self.get_current_client()
+                media = InputMediaPhoto(file_id)
+                await client(SendMediaRequest(chat_id, media=media, message=caption))
+            except Exception as e:
+                print(f"[!] Ошибка отправки фото: {e}")
+                try:
+                    await self.switch_to_next_account()
+                except Exception:
+                    return
+                if retry:
+                    await self.send_photo(chat_id, file_id, caption, retry=False)
+
+    async def send_video(self, chat_id, file_id, caption, retry=True):
+        async with self.lock:
+            try:
+                client = self.get_current_client()
+                media = InputMediaDocument(file_id)
+                await client(SendMediaRequest(chat_id, media=media, message=caption))
+            except Exception as e:
+                print(f"[!] Ошибка отправки видео: {e}")
+                try:
+                    await self.switch_to_next_account()
+                except Exception:
+                    return
+                if retry:
+                    await self.send_video(chat_id, file_id, caption, retry=False)
+
+    async def notify_admin_no_active_accounts(self):
+        try:
+            for i in super_adm:
+                await admin_bot.send_message(i, "❗ Нет активных Telegram-аккаунтов для отправки сообщений.")
+        except Exception as e:
+            print(f"[Ошибка при отправке админу]: {e}")
+
+    async def disconnect_all(self):
+        for client in self._clients.values():
+            try:
+                await client.disconnect()
+            except:
+                pass  # Игнорируем ошибки при отключении
+
+    async def safe_get_entity(self, identifier, retries=3):
+        """Безопасное получение сущности с обработкой через AccountManager"""
+        from utils.account_manager import account_manager
+        
+        async def _get_entity():
+            client = await self.get_current_client_safe()
+            return await client.get_entity(identifier)
+        
+        # Используем account_manager для retry логики
+        result = await account_manager.execute_with_retry(self, _get_entity)
+        
+        # Если результат None, значит произошло переключение аккаунта
+        if result is None:
+            # Пробуем еще раз с новым аккаунтом
+            try:
+                client = await self.get_current_client_safe()
+                return await client.get_entity(identifier)
+            except Exception as e:
+                print(f"[!] Failed to get entity with new account: {e}")
+                raise e
+        
+        return result
+
+    async def safe_iter_messages(self, entity, **kwargs):
+        """Безопасная итерация сообщений с обработкой через AccountManager"""
+        from utils.account_manager import account_manager
+        
+        kwargs.setdefault('wait_time', 3)
+        
+        async def _iter_messages():
+            client = await self.get_current_client_safe()
+            messages = []
+            async for message in client.iter_messages(entity, **kwargs):
+                messages.append(message)
+            return messages
+        
+        # Используем account_manager для retry логики
+        result = await account_manager.execute_with_retry(self, _iter_messages)
+        
+        # Если результат None, значит произошло переключение аккаунта
+        if result is None:
+            # Пробуем еще раз с новым аккаунтом
+            try:
+                client = await self.get_current_client_safe()
+                async for message in client.iter_messages(entity, **kwargs):
+                    yield message
+                return
+            except Exception as e:
+                print(f"[!] Failed to iterate messages with new account: {e}")
+                return
+        
+        # Возвращаем сообщения
+        for message in result:
+            yield message
+
+    def get_account_count(self):
+        """Получить количество активных аккаунтов"""
+        return len(self._clients)
+
+    def get_account_list(self):
+        """Получить список аккаунтов"""
+        return list(self._clients.keys())
+
+    async def remove_account_by_name(self, session_name: str):
+        """Удалить аккаунт по имени"""
+        if session_name in self._clients:
+            client = self._clients.pop(session_name)
+            try:
+                await client.disconnect()
+            except:
+                pass
+            
+            # Удаляем файл
+            session_path = os.path.join(self.ACCOUNTS_DIR, session_name)
+            if os.path.exists(session_path):
+                try:
+                    os.remove(session_path)
+                except:
+                    pass
+            
+            # Если это был текущий аккаунт, переключаемся
+            if self.current_client_key == session_name:
+                if self._clients:
+                    self.current_client_key = list(self._clients.keys())[0]
+                else:
+                    self.current_client_key = None
+            
+            return True
+        return False
+
+telegram_client_wrapper = TelegramClientWrapper()
