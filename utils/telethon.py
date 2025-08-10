@@ -1,9 +1,15 @@
 import os
 import asyncio
-from telethon import TelegramClient
+import tempfile
+from telethon import TelegramClient, __version__ as telethon_version
 from telethon.errors import PhoneNumberBannedError, FloodWaitError, AuthKeyUnregisteredError
+try:
+    from telethon.errors import CDNFileHashMismatchError
+except ImportError:
+    class CDNFileHashMismatchError(Exception):
+        pass
 from telethon.tl.functions.messages import SendMediaRequest
-from telethon.tl.types import InputMediaPhoto, InputMediaDocument
+from telethon.tl.types import InputMediaPhoto, InputMediaDocument, MessageMediaDocument, MessageMediaPhoto
 
 from aiogram import Bot
 
@@ -51,7 +57,39 @@ class TelegramClientWrapper:
 
     async def _try_add_account(self, session_name):
         session_path = os.path.join(self.ACCOUNTS_DIR, session_name)
-        client = TelegramClient(session_path, self.api_id, self.api_hash)
+        
+        print(f"[INFO] Telethon version: {telethon_version}")
+        
+        # Для Telethon 1.37.0 пробуем разные варианты настроек
+        client = None
+        
+        # Вариант 1: Пробуем с connection_retries и auto_reconnect
+        try:
+            client = TelegramClient(
+                session_path, 
+                self.api_id, 
+                self.api_hash,
+                connection_retries=3,
+                auto_reconnect=True
+            )
+            print(f"[INFO] Created client with connection_retries for {session_name}")
+        except TypeError:
+            print(f"[INFO] connection_retries not supported, trying basic client")
+            # Вариант 2: Базовый клиент
+            try:
+                client = TelegramClient(
+                    session_path, 
+                    self.api_id, 
+                    self.api_hash
+                )
+                print(f"[INFO] Created basic client for {session_name}")
+            except Exception as e:
+                print(f"[ERROR] Failed to create client for {session_name}: {e}")
+                raise e
+        
+        if client is None:
+            raise Exception(f"Failed to create client for {session_name}")
+        
         await client.connect()
         if not await client.is_user_authorized():
             await client.disconnect()
@@ -145,6 +183,78 @@ class TelegramClientWrapper:
                 raise Exception("Не удалось подключиться ни к одному клиенту")
     
         return client
+
+    async def safe_download_with_fallback(self, media, temp_dir=None, max_retries=3):
+        """
+        Безопасная загрузка медиа с fallback методами для Telethon 1.37.0
+        """
+        for attempt in range(max_retries):
+            try:
+                client = await self.get_current_client_safe()
+                
+                # Метод 1: Стандартная загрузка (попытка 0)
+                if attempt == 0:
+                    try:
+                        path = await client.download_media(media, file=temp_dir)
+                        if path and os.path.exists(path):
+                            print(f"[+] Media downloaded successfully on attempt {attempt + 1}")
+                            return path
+                    except Exception as e:
+                        error_str = str(e)
+                        if ("cdn" in error_str.lower() or 
+                            "Failed to get DC" in error_str or 
+                            "hash mismatch" in error_str.lower() or
+                            "203" in error_str):
+                            print(f"[!] CDN error detected on attempt {attempt + 1}: {e}")
+                            # Переходим к следующей попытке
+                            await asyncio.sleep(1)
+                            continue
+                        # Для других ошибок - перебрасываем
+                        raise
+                
+                # Метод 2: Повторная попытка с задержкой (попытка 1)
+                elif attempt == 1:
+                    print(f"[!] Retrying download with longer delay...")
+                    await asyncio.sleep(3)
+                    try:
+                        path = await client.download_media(media, file=temp_dir)
+                        if path and os.path.exists(path):
+                            print(f"[+] Media downloaded on retry attempt {attempt + 1}")
+                            return path
+                    except Exception as e:
+                        print(f"[!] Retry download failed: {e}")
+                        await asyncio.sleep(2)
+                        continue
+                
+                # Метод 3: Попытка с переключением аккаунта (попытка 2)
+                else:
+                    try:
+                        print("[!] Trying with account switch...")
+                        await self.switch_to_next_account()
+                        new_client = await self.get_current_client_safe()
+                        path = await new_client.download_media(media, file=temp_dir)
+                        if path and os.path.exists(path):
+                            print(f"[+] Media downloaded with new account")
+                            return path
+                    except Exception as e:
+                        print(f"[!] Alternative account download failed: {e}")
+                        break
+                        
+            except FloodWaitError as e:
+                if attempt < max_retries - 1:
+                    print(f"[!] Flood wait {e.seconds}s on attempt {attempt + 1}")
+                    await asyncio.sleep(e.seconds)
+                    continue
+                break
+            except Exception as e:
+                print(f"[!] Download attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(3 + attempt)  # Увеличиваем задержку
+                    continue
+                break
+        
+        print(f"[!] All download attempts failed for media")
+        return None
 
     async def reconnect_current_client(self):
         """Переподключить текущий клиент"""

@@ -2,9 +2,9 @@ import asyncio
 import re
 import shutil
 import tempfile
+import os
 
 import demoji
-import os
 
 from aiogram import Bot
 from aiogram.types import InputFile, FSInputFile, InputMediaPhoto, InputMediaVideo
@@ -15,6 +15,12 @@ from telethon.tl.types import (
     MessageMediaDocument,
     MessageMediaWebPage,
 )
+from telethon.errors import FloodWaitError
+try:
+    from telethon.errors import CDNFileHashMismatchError
+except ImportError:
+    class CDNFileHashMismatchError(Exception):
+        pass
 from utils.telethon import TelegramClientWrapper
 import utils.text_corrector
 from core.repositories.stop_words import StopWordsRepository
@@ -164,9 +170,47 @@ async def get_message_media_group(client, message):
     return media_list
 
 
-async def process_media(media_list, client, message_id="unknown"):
+async def safe_download_media(client_wrapper, media, temp_dir, max_retries=3):
     """
-    Обрабатывает список медиа файлов
+    Безопасная загрузка медиа с retry и fallback без CDN
+    """
+    for attempt in range(max_retries):
+        try:
+            # Используем новый метод безопасной загрузки из TelegramClientWrapper
+            path = await client_wrapper.safe_download_with_fallback(media, temp_dir)
+            if path and os.path.exists(path):
+                return path
+                
+        except FloodWaitError as e:
+            await log_media_error("download", f"Flood wait {e.seconds}s on attempt {attempt + 1}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(e.seconds)
+                continue
+            
+        except Exception as e:
+            error_msg = str(e)
+            await log_media_error("download", f"Attempt {attempt + 1} failed: {error_msg}")
+            
+            # Проверяем CDN ошибки по тексту
+            if ("cdn" in error_msg.lower() or 
+                "Failed to get DC" in error_msg or 
+                "hash mismatch" in error_msg.lower()):
+                await log_media_error("download", f"CDN error detected on attempt {attempt + 1}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+            
+            # Для других ошибок - стандартная задержка
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+                continue
+    
+    return None
+
+
+async def process_media(media_list, client_wrapper, message_id="unknown"):
+    """
+    Обрабатывает список медиа файлов с улучшенной загрузкой
     """
     processed_media = []
 
@@ -190,28 +234,48 @@ async def process_media(media_list, client, message_id="unknown"):
     
     await log_media_processing(message_id, len(media_list), ", ".join(media_types))
 
+    # Создаем временную директорию
+    temp_dir = tempfile.mkdtemp(prefix="telethon_media_")
+
     for i, media in enumerate(media_list):
         try:
             if isinstance(media, MessageMediaPhoto):
-                processed_media.append(media)
-                await log_media_download(message_id, i + 1, "photo")
+                path = await safe_download_media(client_wrapper, media, temp_dir)
+                if path:
+                    processed_media.append(path)
+                    await log_media_download(message_id, i + 1, "photo")
+                else:
+                    await log_media_skip(message_id, i + 1, "photo download failed")
+                    
             elif isinstance(media, MessageMediaDocument):
                 if media.document.mime_type.startswith("video/"):
                     size_mb = media.document.size / (1024 * 1024)
                     if media.document.size > 50 * 1024 * 1024:  # 50 MB
                         await log_media_skip(message_id, i + 1, f"video too large ({size_mb:.1f}MB)")
                         continue
-                    processed_media.append(media)
-                    await log_media_download(message_id, i + 1, "video", size_mb)
+                    
+                    path = await safe_download_media(client_wrapper, media, temp_dir)
+                    if path:
+                        processed_media.append(path)
+                        await log_media_download(message_id, i + 1, "video", size_mb)
+                    else:
+                        await log_media_skip(message_id, i + 1, "video download failed")
+                        
                 elif media.document.mime_type.startswith("image/"):
-                    processed_media.append(media)
-                    await log_media_download(message_id, i + 1, "image")
+                    path = await safe_download_media(client_wrapper, media, temp_dir)
+                    if path:
+                        processed_media.append(path)
+                        await log_media_download(message_id, i + 1, "image")
+                    else:
+                        await log_media_skip(message_id, i + 1, "image download failed")
                 else:
                     await log_media_skip(message_id, i + 1, f"unsupported type: {media.document.mime_type}")
+                    
             elif isinstance(media, MessageMediaWebPage):
                 await log_media_skip(message_id, i + 1, "webpage")
             else:
                 await log_media_skip(message_id, i + 1, f"unknown type: {type(media)}")
+                
         except Exception as e:
             await log_media_error(message_id, f"Error processing media {i + 1}: {e}")
             continue
@@ -219,6 +283,13 @@ async def process_media(media_list, client, message_id="unknown"):
     # Ограничиваем количество медиа
     if len(processed_media) > 3:
         await log_media_skip(message_id, "excess", f"too many files ({len(processed_media)}), limiting to 3")
+        # Удаляем лишние файлы
+        for path in processed_media[3:]:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except:
+                pass
         processed_media = processed_media[:3]
 
     return processed_media
@@ -260,25 +331,23 @@ async def remove_words_from_db(text):
                 if len(part) > 3:  # Только длинные значимые части
                     text = re.sub(r'\b' + re.escape(part) + r'\b', '', text, flags=re.IGNORECASE)
         
-        
+        # 5. Удаление длинных слов без границ слов
         if len(word) > 5:  
             text = re.sub(re.escape(word), '', text, flags=re.IGNORECASE)
             if clean_word and len(clean_word) > 5:
                 text = re.sub(re.escape(clean_word), '', text, flags=re.IGNORECASE)
     
-    #
+    # Очистка текста
     text = re.sub(r'\s+', ' ', text)  # Множественные пробелы в один
     
-    
+    # Исправляем пунктуацию
     text = re.sub(r'\s+([,.!?;:])', r'\1', text)
     text = re.sub(r'([,.!?;:])\s+([,.!?;:])', r'\1\2', text)  
-    
-    text = re.sub(r'^\s+|\s+$', '', text) 
     
     return text
 
 
-async def rewrite_message(message, client, stop_words=["|UGM|"]):
+async def rewrite_message(message, client_wrapper, stop_words=["|UGM|"]):
     message_id = getattr(message, 'id', 'unknown')
     text = message.message
     
@@ -317,11 +386,11 @@ async def rewrite_message(message, client, stop_words=["|UGM|"]):
     text = text.strip()  # Убираем пробелы в начале и конце
 
     # Получаем все медиа файлы из группы (альбома)
-    media_list = await get_message_media_group(client, message)
+    media_list = await get_message_media_group(client_wrapper.get_current_client(), message)
 
     if media_list:
-        # Обрабатываем медиа
-        processed_media = await process_media(media_list, client, message_id)
+        # Обрабатываем медиа с новым безопасным методом
+        processed_media = await process_media(media_list, client_wrapper, message_id)
         await log_media_final(message_id, len(processed_media), len(text))
         return text, processed_media
     else:
@@ -347,20 +416,26 @@ async def send_to_channel(text, media_list, channel_username, telethon_client,
     await log_send_start(channel_username, text_length, media_count)
 
     try:
-        # Скачиваем все файлы
-        if media_list:
+        # Если media_list содержит пути к файлам (уже скачанные)
+        if media_list and isinstance(media_list[0], str):
+            media_paths = [(path, "photo" if path.lower().endswith(('.jpg', '.jpeg', '.png', '.gif')) else "video") 
+                          for path in media_list]
+        # Если media_list содержит объекты медиа (нужно скачивать)
+        elif media_list:
             for i, media in enumerate(media_list):
                 try:
                     if isinstance(media, MessageMediaDocument):
                         doc = media.document
                         if doc.mime_type:
                             if doc.mime_type.startswith("video/") or doc.mime_type.startswith("image/"):
-                                path = await telethon_client.download_media(media, file=temp_dir)
+                                # Используем TelegramClientWrapper для безопасной загрузки
+                                path = await telethon_client.safe_download_with_fallback(media, temp_dir)
                                 if path:
                                     media_type = "video" if doc.mime_type.startswith("video/") else "photo"
                                     media_paths.append((path, media_type))
                     elif isinstance(media, MessageMediaPhoto):
-                        path = await telethon_client.download_media(media, file=temp_dir)
+                        # Используем TelegramClientWrapper для безопасной загрузки
+                        path = await telethon_client.safe_download_with_fallback(media, temp_dir)
                         if path:
                             media_paths.append((path, "photo"))
                 except Exception as e:
@@ -427,14 +502,14 @@ async def send_to_channel(text, media_list, channel_username, telethon_client,
 
 
 # Исправленная функция main_rer
-async def main_rer(message, targ_chat, client, stop_words=[]):
+async def main_rer(message, targ_chat, client_wrapper, stop_words=[]):
     """
     Основная функция для обработки и отправки сообщения
 
     Args:
         message: Объект сообщения Telegram
         targ_chat: ID или username целевого чата
-        client: Telegram клиент
+        client_wrapper: Telegram client wrapper
         stop_words: Список стоп-слов для фильтрации
 
     Returns:
@@ -443,10 +518,10 @@ async def main_rer(message, targ_chat, client, stop_words=[]):
     message_id = getattr(message, 'id', 'unknown')
 
     try:
-        new_text, new_media_list = await rewrite_message(message, client, stop_words)
+        new_text, new_media_list = await rewrite_message(message, client_wrapper, stop_words)
 
         if new_text or new_media_list:
-            success = await send_to_channel(new_text, new_media_list, targ_chat, client)
+            success = await send_to_channel(new_text, new_media_list, targ_chat, client_wrapper)
             return success
         else:
             return False
@@ -458,15 +533,15 @@ async def main_rer(message, targ_chat, client, stop_words=[]):
 
 # Пример использования
 async def main():
-    client = TelegramClientWrapper()
+    from utils.telethon import telegram_client_wrapper
 
     # Пример сообщения
     message = ...  # Замените на реальное сообщение
     targ_chat = "target_channel_username"  # Замените на реальный канал
 
-    await main_rer(message, targ_chat, client)
+    await main_rer(message, targ_chat, telegram_client_wrapper)
 
-    await client.disconnect()
+    await telegram_client_wrapper.disconnect_all()
 
 
 if __name__ == "__main__":

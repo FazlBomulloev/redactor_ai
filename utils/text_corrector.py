@@ -590,13 +590,9 @@ async def enhanced_send_to_channel(text, media_list, channel_username, telethon_
             await log_media_error("cleanup", f"Error cleaning temp directory: {e}")
 
 
-# Глобальный экземпляр корректора
-text_corrector = TextCorrector()
 
-
-# АВТОМАТИЧЕСКАЯ ИНТЕГРАЦИЯ В СУЩЕСТВУЮЩУЮ СИСТЕМУ
 def integrate_corrector():
-    """Автоматически интегрирует корректор в существующую систему"""
+    """Интегрирует корректор в существующую систему (вызывается вручную)"""
     try:
         import utils.rerate as rerate_module
         
@@ -608,10 +604,12 @@ def integrate_corrector():
         rerate_module.send_to_channel = enhanced_send_to_channel
         
         logger.info("✅ Text corrector integrated successfully!")
+        return True
         
     except Exception as e:
         logger.error(f"❌ Failed to integrate text corrector: {e}")
+        return False
 
 
-# Автоматическая интеграция при импорте модуля
-integrate_corrector()
+# Глобальный экземпляр корректора
+text_corrector = TextCorrector()

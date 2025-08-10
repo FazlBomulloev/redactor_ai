@@ -1,6 +1,6 @@
-import os
 import asyncio
 import logging
+import os
 from datetime import datetime
 from typing import Optional, List
 from pathlib import Path
@@ -13,6 +13,13 @@ from telethon.errors import (
     SessionPasswordNeededError,
     PhoneNumberInvalidError
 )
+from telethon.errors.common import TypeNotFoundError  
+try:
+    from telethon.errors import CDNFileHashMismatchError
+except ImportError:
+    # Создаем заглушку если ошибка не существует
+    class CDNFileHashMismatchError(Exception):
+        pass
 
 from logger import log_media_error  # Используем медиа логгер для аккаунтов
 from aiogram import Bot
@@ -24,6 +31,7 @@ LOG_CHAT_ID = -1002597796340
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 5  # секунд
 
+
 class AccountManager:
     def __init__(self):
         self.banned_errors = [
@@ -32,11 +40,15 @@ class AccountManager:
             UserDeactivatedBanError,
             PhoneNumberInvalidError
         ]
+        self.corruption_errors = [
+            TypeNotFoundError,  # Ошибки коррупции протокола
+        ]
         self.retry_errors = [
             FloodWaitError,
             ConnectionError,
-            TimeoutError
+            TimeoutError,
         ]
+        # CDN ошибки будем определять по тексту
         
     async def log_to_chat(self, message, level="INFO"):
         """Отправка сообщения в чат логов"""
@@ -111,17 +123,27 @@ class AccountManager:
         """Проверить, нужно ли повторять запрос"""
         return any(isinstance(error, retry_error) for retry_error in self.retry_errors)
 
+    def is_corruption_error(self, error: Exception) -> bool:
+        """Проверить, является ли ошибка коррупцией протокола"""
+        error_str = str(error)
+        return (
+            any(isinstance(error, corruption_error) for corruption_error in self.corruption_errors) or
+            "Could not find a matching Constructor ID" in error_str or
+            "TypeNotFoundError" in error_str
+        )
+
+    def is_cdn_error(self, error: Exception) -> bool:
+        """Проверить, является ли ошибка связанной с CDN"""
+        error_str = str(error)
+        return (
+            "Failed to get DC" in error_str or
+            "cdn" in error_str.lower() or
+            "hash mismatch" in error_str.lower()
+        )
+
     async def execute_with_retry(self, client_wrapper, operation_func, *args, **kwargs):
         """
         Выполнить операцию с повторными попытками и обработкой банов
-        
-        Args:
-            client_wrapper: TelegramClientWrapper instance
-            operation_func: Функция для выполнения (например, fetch_posts)
-            *args, **kwargs: Аргументы для функции
-        
-        Returns:
-            Результат операции или None при неудаче
         """
         current_account = client_wrapper.current_client_key
         
@@ -134,24 +156,19 @@ class AccountManager:
             except Exception as e:
                 logging.error(f"Attempt {attempt + 1}/{RETRY_ATTEMPTS} failed: {e}")
                 
-                # Если это бан - сразу удаляем аккаунт
+                # Бан
                 if self.is_ban_error(e):
                     await self.log_to_chat(
                         f"🚫 Account banned: {current_account} | Error: {type(e).__name__}",
                         "ERROR"
                     )
-                    
-                    # Удаляем аккаунт
                     await self.remove_account(current_account, f"banned: {type(e).__name__}")
-                    
-                    # Переключаемся на следующий аккаунт
                     try:
                         await client_wrapper.switch_to_next_account()
                         await self.log_to_chat(
                             f"🔄 Switched to next account: {client_wrapper.current_client_key}",
                             "INFO"
                         )
-                        # Не делаем retry, возвращаем None для переключения
                         return None
                     except Exception as switch_error:
                         await self.log_to_chat(
@@ -159,8 +176,43 @@ class AccountManager:
                             "ERROR"
                         )
                         return None
-                
-                # Если это ошибка для retry
+
+                # Ошибка коррупции протокола
+                elif self.is_corruption_error(e):
+                    await self.log_to_chat(
+                        f"🔧 Protocol corruption detected: {current_account} | Error: {type(e).__name__}",
+                        "ERROR"
+                    )
+                    try:
+                        await client_wrapper.switch_to_next_account()
+                        await self.log_to_chat(
+                            f"🔄 Switched account due to corruption: {client_wrapper.current_client_key}",
+                            "INFO"
+                        )
+                        return None
+                    except Exception as switch_error:
+                        await self.log_to_chat(
+                            f"❌ Failed to switch account: {str(switch_error)[:200]}",
+                            "ERROR"
+                        )
+                        return None
+
+                # CDN ошибка
+                elif self.is_cdn_error(e):
+                    await self.log_to_chat(
+                        f"📡 CDN error detected: {current_account} | Attempt {attempt + 1}/{RETRY_ATTEMPTS}",
+                        "WARNING"
+                    )
+                    if attempt < RETRY_ATTEMPTS - 1:
+                        wait_time = RETRY_DELAY * (2 ** attempt)
+                        await self.log_to_chat(
+                            f"⏳ CDN retry in {wait_time}s | Account: {current_account}",
+                            "WARNING"
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+
+                # Retry ошибка
                 elif self.is_retry_error(e) and attempt < RETRY_ATTEMPTS - 1:
                     await self.log_to_chat(
                         f"⏳ Retry {attempt + 1}/{RETRY_ATTEMPTS} in {RETRY_DELAY}s | Account: {current_account}",
@@ -168,15 +220,13 @@ class AccountManager:
                     )
                     await asyncio.sleep(RETRY_DELAY)
                     continue
-                
-                # Если последняя попытка или неизвестная ошибка
+
+                # Последняя попытка
                 elif attempt == RETRY_ATTEMPTS - 1:
                     await self.log_to_chat(
                         f"❌ All retries failed for {current_account} | Error: {str(e)[:200]}",
                         "ERROR"
                     )
-                    
-                    # Переключаемся на следующий аккаунт
                     try:
                         await client_wrapper.switch_to_next_account()
                         await self.log_to_chat(
@@ -188,7 +238,6 @@ class AccountManager:
                             f"❌ Failed to switch after retries: {str(switch_error)[:200]}",
                             "ERROR"
                         )
-                    
                     return None
         
         return None
@@ -201,6 +250,7 @@ class AccountManager:
             "account_list": accounts,
             "accounts_dir": ACCOUNTS_DIR
         }
+
 
 # Глобальный экземпляр менеджера
 account_manager = AccountManager()
